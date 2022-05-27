@@ -1,0 +1,201 @@
+#!/bin/sh
+
+set -e
+
+usage () {
+    cat << 'USAGE'
+Usage: lxd-build [options] [BUILD_SCRIPT]
+       lxd-build --help
+       lxd-build --version
+
+Create LXD instance using instructions from BUILD_SCRIPT
+
+If BUILD_SCRIPT is not given or is '-', the build instructions will be read
+from stdin
+
+Options:
+    -a, --arg NAME=VALUE
+        Define a build argument. This option is repeatable.
+
+    -f, --force
+        Delete INSTANCE_NAME if it already exists.
+
+    -h, --help
+        Show this help message and exit.
+
+    -n, --name INSTANCE_NAME
+        Instance name. If not given, a random name will be used.
+
+    -v, --verbose
+        Be more verbose.
+        This option only affects verbosity of lxd-build itself, not the
+        verbosity of build scripts
+
+    -V, --version
+        Print lxd-build version and exit.
+
+USAGE
+}
+
+lxd_build () {
+    local LXD_BUILD_VERSION
+    local LXD_BUILD_FORCE LXD_BUILD_VERBOSE LXD_BUILD_INSTANCE_IS_CREATED
+    local LXD_INSTANCE_NAME LXD_IMAGE
+    local LXC_EXEC_USER
+    local SH_PRELUDE
+    local build_script opts opts_short opts_long
+
+    LXD_BUILD_VERSION="0.1.0"
+
+    LXD_BUILD_FORCE="no"
+    LXD_BUILD_VERBOSE="no"
+    LXD_BUILD_INSTANCE_IS_CREATED="no"
+
+    SH_PRELUDE=":"
+
+    opts_short='a:fhn:vV'
+    opts_long='arg:,force,help,name:,verbose,version'
+    opts=$(getopt -n 'lxd-build' -o "$opts_short" -l "$opts_long" -- "$@")
+    eval set -- "$opts"
+    while true; do
+        case "$1" in
+            -a|--arg) lxd_build_add_arg "$2"; shift 2 ;;
+            -f|--force) LXD_BUILD_FORCE="yes"; shift ;;
+            -h|--help) usage; exit ;;
+            -n|--name) LXD_INSTANCE_NAME="$2"; shift 2 ;;
+            -v|--verbose) LXD_BUILD_VERBOSE="yes"; shift ;;
+            -V|--version) echo "$LXD_BUILD_VERSION"; exit ;;
+            --) shift; break ;;
+        esac
+    done
+
+    build_script=$1
+    if [ -z "$build_script" -o "$build_script" = '-' ]; then
+        build_script="/dev/stdin"
+    elif [ -r "$build_script" ]; then
+        build_script=$(realpath "$build_script")
+    else
+        lxc_build_log 'Error: file does not exist or is not readable: %s' "$build_script"
+        exit 1
+    fi
+
+    # Always start as root
+    LXC_EXEC_USER=root
+
+    . "$build_script"
+
+    if [ "$LXD_BUILD_INSTANCE_IS_CREATED" != "yes" ]; then
+        lxd_build_log "Error: no instance was created"
+        exit 1
+    fi
+
+    lxd_build_log "Instance '%s' is ready !" "$LXD_INSTANCE_NAME"
+}
+
+lxd_build_add_arg () {
+    local arg name value; arg=$1
+    IFS='=' read -r name value <<EOF
+$arg
+EOF
+    if [ -z "$name" -o -z "$value" ]; then
+        lxd_build_log "Error: invalid parameter --arg: '%s'" "$arg"
+        exit 1
+    fi
+
+    eval "LXD_BUILD_ARG_$name=$(lxd_build_quote "$value")"
+}
+
+# Transform single quotes into '"'"' and surround result with single quotes
+# Example:
+# Input: A string with 'quotes'
+# Output: 'A string with '"'"'quotes'"'"''
+lxd_build_quote () {
+    printf "%s\n" "$1" | sed -e "s/'/'\"'\"'/g" -e "1s/^/'/" -e "\$s/\$/'/"
+}
+
+lxd_build_log () {
+    local format; format=$1; shift
+
+    printf >&2 "lxd-build: $format\\n" "$@"
+}
+
+lxd_build_info () {
+    if [ "$LXD_BUILD_VERBOSE" = "yes" ]; then
+        lxd_build_log "$@"
+    fi
+}
+
+FROM () {
+    LXD_IMAGE=$1
+
+    lxd_build_info 'FROM %s' "$LXD_IMAGE"
+
+    if [ -z "$LXD_INSTANCE_NAME" ]; then
+        LXD_INSTANCE_NAME=$(lxc init --quiet "$LXD_IMAGE" </dev/null | awk '{print $NF}')
+    else
+        if lxc info "$LXD_INSTANCE_NAME" >/dev/null 2>/dev/null; then
+            if [ "$LXD_BUILD_FORCE" = "yes" ]; then
+                lxd_build_info "Deleting instance '%s'" "$LXD_INSTANCE_NAME"
+                lxc delete -f "$LXD_INSTANCE_NAME"
+            else
+                lxd_build_log "Error: instance '%s' already exists" "$LXD_INSTANCE_NAME"
+                exit 1
+            fi
+        fi
+        lxc init --quiet "$LXD_IMAGE" "$LXD_INSTANCE_NAME" </dev/null
+    fi
+
+    lxd_build_info "Starting instance '%s'" "$LXD_INSTANCE_NAME"
+    lxc start --quiet "$LXD_INSTANCE_NAME"
+    lxd_build_info "Instance '%s' started" "$LXD_INSTANCE_NAME"
+
+    # Wait for init to start
+    sleep 1
+
+    # If systemd is installed, wait until the boot process is completed
+    # Otherwise, just wait a little more...
+    # TODO: Do the same for other init systems if possible
+    lxc exec --disable-stdin "$LXD_INSTANCE_NAME" -- sh -c 'if test -x /bin/systemctl; then systemctl is-system-running --wait --quiet; else sleep 1; fi'
+
+    LXD_BUILD_INSTANCE_IS_CREATED="yes"
+}
+
+ARG () {
+    local name default; name=$1; default=$2
+    local value
+
+    value=$(eval "printf '%s' \"\$LXD_BUILD_ARG_$name\"")
+    : ${value:=$default}
+
+    lxd_build_info 'ARG %s=%s' "$name" "$value"
+
+    ENV "$name" "$value"
+}
+
+ENV () {
+    SH_PRELUDE="${SH_PRELUDE};export $1=$(lxd_build_quote "$2")"
+}
+
+USER () {
+    local user; user=$1
+
+    lxd_build_info 'USER %s' "$user"
+
+    LXC_EXEC_USER="$user"
+}
+
+RUN () {
+    local cmd; cmd=$1
+    if [ -z "$cmd" -a ! -t 0 ]; then
+        cmd=$(cat -)
+    fi
+
+    if [ -n "$cmd" ]; then
+        lxd_build_info "RUN << 'SH'\\n%s\\nSH" "$cmd"
+        lxc exec --disable-stdin "$LXD_INSTANCE_NAME" -- su -s /bin/sh -c "$SH_PRELUDE; set -ex; $cmd" - "$LXC_EXEC_USER"
+    else
+        lxd_build_log 'Warning: RUN called without arguments or input'
+    fi
+}
+
+lxd_build "$@"
